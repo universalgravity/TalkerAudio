@@ -25,7 +25,7 @@ public enum StreamSynthesizerPlayerError: String, LocalizedError {
 @MainActor
 public class StreamSynthesizerPlayer {
     //    private var synthesizerPlayers: [StreamSynthesizerProtocol] = []
-    private let finished = OneShotChannel()
+    private var finished = OneShotChannel()
     private let allPlayers: Lock<[any StreamSynthesizerProtocol & Sendable]> = Lock([])
     private var task: Task<(), Error>? = nil
     private let newPlayerFunc:
@@ -65,6 +65,12 @@ public class StreamSynthesizerPlayer {
         style: String,
         role: String
     ) async throws {
+        // Reset per-round state so this instance can be reused across multiple
+        // teacherSpeak / playOrStop calls without recreating the whole object.
+        finished = OneShotChannel()
+        allPlayers.withLock { $0.removeAll() }
+        task = nil
+
         let finished = finished
         isPlaying = true
         task = Task { [unowned self] in
