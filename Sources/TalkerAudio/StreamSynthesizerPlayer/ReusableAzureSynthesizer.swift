@@ -12,7 +12,8 @@ import TalkerAudioObjC
 import TalkerCommon
 
 /// Represents one in-flight synthesis request bound to a specific StreamAudioPlayer.
-public struct ActiveSynthRequest: Sendable {
+/// Only accessed under `requestLock` — no Sendable conformance needed.
+public struct ActiveSynthRequest {
     let resultId: String
     let player: StreamAudio.StreamAudioPlayer
     let channel: OneShotChannel<Void>

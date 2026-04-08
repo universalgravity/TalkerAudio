@@ -12,6 +12,16 @@ import StreamAudio
 import SwiftUI
 import TalkerCommon
 
+public enum StreamSynthesizerError: String, LocalizedError, Sendable {
+    case speechSynthesizerNotExist
+    case synthesizeCancelled
+    case allocBuffer
+
+    public var errorDescription: String? {
+        self.rawValue
+    }
+}
+
 public class AzureStreamSynthesizer: StreamSynthesizerProtocol {
 
     private let reusable: ReusableAzureSynthesizer
