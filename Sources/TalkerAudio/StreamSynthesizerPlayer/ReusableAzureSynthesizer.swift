@@ -2,8 +2,9 @@
 //  ReusableAzureSynthesizer.swift
 //  TalkerAudio
 //
-//  Long-lived Azure TTS session that keeps SPXSpeechSynthesizer + SPXConnection
-//  alive across multiple synthesis requests, eliminating per-sentence TLS handshakes.
+//  Long-lived Azure TTS session scoped to a single StreamSynthesizerPlayer.
+//  Keeps SPXSpeechSynthesizer + SPXConnection alive across sentences,
+//  eliminating per-sentence TLS handshakes.
 //
 
 import Foundation
@@ -11,34 +12,33 @@ import StreamAudio
 import TalkerAudioObjC
 import TalkerCommon
 
-/// Represents one in-flight synthesis request bound to a specific StreamAudioPlayer.
-/// Only accessed under `requestLock` — no Sendable conformance needed.
-public struct ActiveSynthRequest {
+/// One in-flight synthesis request. Only accessed under `requestLock`.
+struct ActiveSynthRequest {
     let resultId: String
     let player: StreamAudio.StreamAudioPlayer
     let channel: OneShotChannel<Void>
 }
 
-/// A reusable Azure TTS session.
+/// Player-scoped Azure TTS session.
 ///
-/// Holds a single `SPXSpeechSynthesizer` + `SPXConnection` for the lifetime of
-/// the app (or until explicitly invalidated). Each `AzureStreamSynthesizer`
-/// instance borrows this session to run one synthesis call.
+/// Owns a single `SPXSpeechSynthesizer` + `SPXConnection` for the lifetime
+/// of its parent `StreamSynthesizerPlayer`. Each `AzureStreamSynthesizer`
+/// borrows this session to run one synthesis call.
 ///
 /// **Concurrency contract**: only one `startSpeaking` may be active at a time.
-/// `StreamSynthesizerPlayer` already serialises load→play per sentence, so this
-/// is naturally satisfied. The `synthLock` acts as a safety net.
+/// `StreamSynthesizerPlayer` serialises load→play per sentence. The `synthLock`
+/// acts as a safety net; reentry throws `synthesizerBusy`.
 public final class ReusableAzureSynthesizer: @unchecked Sendable {
     private let sub: String
     private let region: String
 
-    /// Serialises access to `startSpeaking` so two callers can never race.
+    /// Serialises `startSpeaking` — reentry throws `synthesizerBusy`.
     private let synthLock = NSLock()
 
     private var speechSynthesizer: SPXSpeechSynthesizer?
     private var connection: SPXConnection?
 
-    /// The currently active request. Written under `requestLock`.
+    /// Current in-flight request. Only touched under `requestLock`.
     private let requestLock = NSLock()
     private var _activeRequest: ActiveSynthRequest?
 
@@ -49,8 +49,8 @@ public final class ReusableAzureSynthesizer: @unchecked Sendable {
 
     // MARK: - Lifecycle
 
-    /// Lazily creates the SPXSpeechSynthesizer and pre-opens the connection.
-    /// Safe to call multiple times; only the first call does real work.
+    /// Lazily build the SPXSpeechSynthesizer and pre-open the connection.
+    /// Safe to call multiple times; only the first does real work.
     public func ensureReady() throws {
         synthLock.lock()
         defer { synthLock.unlock() }
@@ -59,56 +59,52 @@ public final class ReusableAzureSynthesizer: @unchecked Sendable {
     }
 
     /// Tear down the Azure session. Next `ensureReady()` or `startSpeaking()`
-    /// will rebuild from scratch. Call on app background or provider switch.
+    /// rebuilds from scratch. Call on page teardown or provider switch.
     public func invalidate() {
         synthLock.lock()
         defer { synthLock.unlock() }
-
-        // Cancel any in-flight request
         cancelActiveRequestLocked(error: StreamSynthesizerError.synthesizeCancelled)
-
         connection = nil
         speechSynthesizer = nil
     }
 
     // MARK: - Synthesis
 
-    /// Begin a synthesis. Audio data flows into `player` via the shared
+    /// Begin one synthesis. Audio data flows into `player` via the shared
     /// `writeHandler`. Returns a channel that fires when Azure signals
-    /// completion or cancellation for this specific `resultId`.
+    /// completion or cancellation for this exact `resultId`.
     ///
-    /// - Precondition: no other synthesis is active (enforced by `synthLock`).
+    /// - Throws: `StreamSynthesizerError.synthesizerBusy` if another call is
+    ///   already in flight.
     public func startSpeaking(ssml: String, player: StreamAudio.StreamAudioPlayer) throws -> OneShotChannel<Void> {
         synthLock.lock()
         defer { synthLock.unlock() }
 
-        // Ensure session is alive
+        // Rebuild session if needed (first call, or after invalidate).
         if speechSynthesizer == nil {
             try buildSession()
         }
 
-        // 1) Prepare a pending request BEFORE calling startSpeakingSsml.
-        //    The channel is already the one we'll return; the resultId is
-        //    filled in after the SDK call returns.
-        let channel = OneShotChannel<Void>()
-
-        // Install the player so writeHandler can route audio immediately.
+        // Guard against reentry.
         requestLock.lock()
-        // Placeholder with empty resultId — will be updated atomically below.
-        _activeRequest = ActiveSynthRequest(resultId: "", player: player, channel: channel)
+        let busy = _activeRequest != nil
         requestLock.unlock()
+        if busy {
+            throw StreamSynthesizerError.synthesizerBusy
+        }
 
-        // 2) Kick off synthesis (synchronous call that returns a result handle).
+        // 1) Kick off synthesis — synchronous SDK call that returns immediately
+        //    with a result handle. The writeHandler callback fires on a background
+        //    thread as audio data arrives.
         let result = try speechSynthesizer!.startSpeakingSsml(ssml)
 
-        // 3) Atomically stamp the real resultId now that we have it.
+        // 2) Now we have the real resultId. Install the request atomically.
+        let channel = OneShotChannel<Void>()
         requestLock.lock()
-        if let req = _activeRequest, req.channel === channel {
-            _activeRequest = ActiveSynthRequest(resultId: result.resultId, player: player, channel: channel)
-        }
+        _activeRequest = ActiveSynthRequest(resultId: result.resultId, player: player, channel: channel)
         requestLock.unlock()
 
-        // 4) If the SDK returned a synchronous cancellation, finish immediately.
+        // 3) If the SDK returned a synchronous cancellation, finish now.
         if result.reason == .canceled {
             finishActiveRequest(resultId: result.resultId, error: StreamSynthesizerError.synthesizeCancelled)
         }
@@ -123,6 +119,7 @@ public final class ReusableAzureSynthesizer: @unchecked Sendable {
 
     // MARK: - Private: session setup
 
+    /// Caller must hold `synthLock`.
     private func buildSession() throws {
         let config = try SPXSpeechConfiguration(subscription: sub, region: region)
         config.setSpeechSynthesisOutputFormat(.audio16Khz32KBitRateMonoMp3)
@@ -154,7 +151,7 @@ public final class ReusableAzureSynthesizer: @unchecked Sendable {
         }
 
         let conn = try SPXConnection(from: synth)
-        conn.open(true) // pre-connect: TCP + TLS handshake happens here
+        conn.open(true) // pre-connect: TCP + TLS handshake happens once here
 
         self.speechSynthesizer = synth
         self.connection = conn
@@ -163,20 +160,17 @@ public final class ReusableAzureSynthesizer: @unchecked Sendable {
 
     // MARK: - Private: request completion
 
-    /// Atomically take the active request if its `resultId` matches (or if
-    /// the resultId is still the placeholder ""), finish the player, then
-    /// signal the channel.
+    /// Take the active request only if `resultId` matches exactly.
     private func finishActiveRequest(resultId: String, error: Error?) {
         requestLock.lock()
-        guard let req = _activeRequest,
-              req.resultId == resultId || req.resultId.isEmpty else {
+        guard let req = _activeRequest, req.resultId == resultId else {
             requestLock.unlock()
             return
         }
         _activeRequest = nil
         requestLock.unlock()
 
-        // Outside lock: finish player data, then signal.
+        // Outside lock: finish data, then signal.
         try? req.player.finishData()
         if let error {
             req.channel.finish(throwing: error)
@@ -185,8 +179,7 @@ public final class ReusableAzureSynthesizer: @unchecked Sendable {
         }
     }
 
-    /// Cancel whatever is active right now (used during invalidate).
-    /// Caller must hold `synthLock`.
+    /// Cancel whatever is active now. Caller must hold `synthLock`.
     private func cancelActiveRequestLocked(error: Error) {
         requestLock.lock()
         let req = _activeRequest

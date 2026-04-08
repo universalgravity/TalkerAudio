@@ -15,6 +15,7 @@ import TalkerCommon
 public enum StreamSynthesizerError: String, LocalizedError, Sendable {
     case speechSynthesizerNotExist
     case synthesizeCancelled
+    case synthesizerBusy
     case allocBuffer
 
     public var errorDescription: String? {

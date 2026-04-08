@@ -22,24 +22,45 @@ public enum StreamSynthesizerPlayerError: String, LocalizedError {
     }
 }
 
+/// Per-round state. Each `streamSynthesize` call creates a fresh instance so
+/// that concurrent-round confusion (waiting on the wrong `finished` channel,
+/// leaking old players, etc.) is structurally impossible.
+private final class RoundState {
+    let finished = OneShotChannel<Void>()
+    let players = Lock<[any StreamSynthesizerProtocol & Sendable]>([])
+    var task: Task<Void, Error>?
+}
+
 @MainActor
 public class StreamSynthesizerPlayer {
-    //    private var synthesizerPlayers: [StreamSynthesizerProtocol] = []
-    private var finished = OneShotChannel()
-    private let allPlayers: Lock<[any StreamSynthesizerProtocol & Sendable]> = Lock([])
-    private var task: Task<(), Error>? = nil
+    /// Optional player-scoped Azure session. `nil` when the provider isn't Azure.
+    public let azureSession: ReusableAzureSynthesizer?
+
+    private var round: RoundState?
     private let newPlayerFunc:
         @Sendable (_ text: String, _ voiceId: String, _ style: String, _ role: String) ->
             any StreamSynthesizerProtocol & Sendable
     public private(set) var isPlaying: Bool = false
 
     public init(
+        azureSession: ReusableAzureSynthesizer? = nil,
         newPlayer: @Sendable @escaping (
             _ text: String, _ voiceId: String, _ style: String, _ role: String
         ) -> StreamSynthesizerProtocol
     ) {
+        self.azureSession = azureSession
         self.newPlayerFunc = newPlayer
     }
+
+    // MARK: - Prewarm
+
+    /// Pre-build the Azure TLS connection so the first sentence doesn't pay
+    /// the full handshake cost. No-op when azureSession is nil.
+    public func prewarmIfNeeded() {
+        try? azureSession?.ensureReady()
+    }
+
+    // MARK: - Synthesize
 
     @MainActor
     public func synthesize(
@@ -65,15 +86,20 @@ public class StreamSynthesizerPlayer {
         style: String,
         role: String
     ) async throws {
-        // Reset per-round state so this instance can be reused across multiple
-        // teacherSpeak / playOrStop calls without recreating the whole object.
-        finished = OneShotChannel()
-        allPlayers.withLock { $0.removeAll() }
-        task = nil
+        // Cancel any previous round still running.
+        if let oldRound = round {
+            oldRound.task?.cancel()
+            // Wait briefly for the old task to clean up (best-effort).
+            try? await oldRound.task?.value
+        }
 
-        let finished = finished
+        // Fresh per-round state — completely isolated from previous rounds.
+        let r = RoundState()
+        round = r
+        let finished = r.finished
         isPlaying = true
-        task = Task { [unowned self] in
+
+        r.task = Task { [unowned self] in
             defer {
                 infoLog("finished.")
                 finished.finish(())
@@ -102,7 +128,7 @@ public class StreamSynthesizerPlayer {
                 group.addTask { @Sendable in
                     for await (text, player) in channel.buffer(policy: .bounded(5)) {
                         try Task.checkCancellation()
-                        self.allPlayers.withLock { $0.append(player) }
+                        r.players.withLock { $0.append(player) }
                         infoLog("start play for: \(text)")
                         try await player.play()
                         infoLog("wait for player to stop")
@@ -117,12 +143,12 @@ public class StreamSynthesizerPlayer {
 
             try Task.checkCancellation()
 
-            infoLog("players count: \(self.allPlayers.withLock { $0.count })")
-            guard let saveTo, !allPlayers.withLock({ $0.isEmpty }) else {
+            infoLog("players count: \(r.players.withLock { $0.count })")
+            guard let saveTo, !r.players.withLock({ $0.isEmpty }) else {
                 return
             }
 
-            let mp3Files = allPlayers.withLock {
+            let mp3Files = r.players.withLock {
                 $0.map { player in
                     player.cachePath()
                 }
@@ -146,25 +172,24 @@ public class StreamSynthesizerPlayer {
             }
         }
 
-        if let task {
+        if let task = r.task {
             try await task.value
         }
     }
 
     @MainActor
     public func waitForPlayerToStop() async throws {
-        try await finished.wait()
+        guard let r = round else { return }
+        try await r.finished.wait()
     }
 
     public func stopPlaying() throws {
         infoLog("stop Playing")
-        guard let task else {
-            return
-        }
-        if !task.isCancelled {
+        guard let r = round else { return }
+        if let task = r.task, !task.isCancelled {
             task.cancel()
         }
-        allPlayers.withLock { players in
+        r.players.withLock { players in
             for player in players {
                 infoLog("stop player inner")
                 if player.isPlaying {
