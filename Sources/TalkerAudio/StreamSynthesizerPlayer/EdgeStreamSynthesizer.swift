@@ -143,14 +143,9 @@ public final class EdgeStreamSynthesizer: NSObject, URLSessionWebSocketDelegate,
     public func play() async throws {
         debugLog("start load: \(self.text)")
         try load()
-        debugLog("wait for load to finish: \(self.text)")
-        do {
-            try await waitForLoadFinished()
-        } catch {
-            errorLog("wait for load error: \(error), \(self.text)")
-            throw error
-        }
-        debugLog("start player: \(self.text)")
+        // Stream-play: start playback immediately, don't wait for full load.
+        // StreamAudioPlayer pauses when data runs out and resumes when more arrives.
+        debugLog("play (streaming): \(self.text)")
         try await player.play()
     }
 

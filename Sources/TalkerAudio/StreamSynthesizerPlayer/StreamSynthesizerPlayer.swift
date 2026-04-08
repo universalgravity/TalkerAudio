@@ -25,7 +25,7 @@ public enum StreamSynthesizerPlayerError: String, LocalizedError {
 /// Per-round state. Each `streamSynthesize` call creates a fresh instance so
 /// that concurrent-round confusion (waiting on the wrong `finished` channel,
 /// leaking old players, etc.) is structurally impossible.
-private final class RoundState {
+private final class RoundState: @unchecked Sendable {
     let finished = OneShotChannel<Void>()
     let players = Lock<[any StreamSynthesizerProtocol & Sendable]>([])
     var task: Task<Void, Error>?
@@ -119,9 +119,13 @@ public class StreamSynthesizerPlayer {
                         infoLog("load for: \(text)")
                         let player = self.newPlayerFunc(text, voiceId, style, role)
                         try player.load()
+                        // Hand to consumer immediately so it can start streaming
+                        // playback (first-packet-plays). Then wait for this sentence's
+                        // synth to finish before starting the next one — keeps Azure
+                        // single-session serialisation intact.
+                        await channel.send((text, player))
                         try await player.waitForLoadFinished()
                         infoLog("load finished for: \(text)")
-                        await channel.send((text, player))
                     }
                 }
 

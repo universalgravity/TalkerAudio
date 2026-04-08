@@ -90,10 +90,12 @@ public class AzureStreamSynthesizer: StreamSynthesizerProtocol {
 
     public func play() async throws {
         try load()
-        try await waitForLoadFinished()
-        infoLog("finish load:", text)
+        // Don't wait for the full sentence to finish synthesizing.
+        // StreamAudioPlayer supports streaming: it will start playback as soon
+        // as the first decodable audio packets arrive, and pause/resume
+        // automatically as more data is written.
+        infoLog("play (streaming):", text)
         try await player.play()
-        infoLog("start play:", text)
     }
 
     public func stop() throws {
