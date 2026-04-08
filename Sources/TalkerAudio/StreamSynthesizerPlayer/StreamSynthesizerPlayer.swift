@@ -86,11 +86,16 @@ public class StreamSynthesizerPlayer {
         style: String,
         role: String
     ) async throws {
-        // Cancel any previous round still running.
+        // Cancel any previous round — fire-and-forget. Don't await the old
+        // task: it may be stuck in waitForLoadFinished/waitForPlayStopped and
+        // we don't want the new round to block on the old one draining.
         if let oldRound = round {
             oldRound.task?.cancel()
-            // Wait briefly for the old task to clean up (best-effort).
-            try? await oldRound.task?.value
+            oldRound.players.withLock { players in
+                for player in players where player.isPlaying {
+                    try? player.stop()
+                }
+            }
         }
 
         // Fresh per-round state — completely isolated from previous rounds.

@@ -93,18 +93,37 @@ public final class ReusableAzureSynthesizer: @unchecked Sendable {
             throw StreamSynthesizerError.synthesizerBusy
         }
 
-        // 1) Kick off synthesis — synchronous SDK call that returns immediately
-        //    with a result handle. The writeHandler callback fires on a background
-        //    thread as audio data arrives.
-        let result = try speechSynthesizer!.startSpeakingSsml(ssml)
-
-        // 2) Now we have the real resultId. Install the request atomically.
+        // 1) Install the player and channel BEFORE kicking off synthesis.
+        //    writeHandler routes audio via _activeRequest.player, so the player
+        //    must be in place before Azure can push the first byte. The resultId
+        //    starts as "" and gets stamped after startSpeakingSsml returns.
         let channel = OneShotChannel<Void>()
         requestLock.lock()
-        _activeRequest = ActiveSynthRequest(resultId: result.resultId, player: player, channel: channel)
+        _activeRequest = ActiveSynthRequest(resultId: "", player: player, channel: channel)
         requestLock.unlock()
 
-        // 3) If the SDK returned a synchronous cancellation, finish now.
+        // 2) Kick off synthesis — synchronous SDK call. writeHandler may fire
+        //    on a background thread while this call is still executing.
+        let result: SPXSpeechSynthesisResult
+        do {
+            result = try speechSynthesizer!.startSpeakingSsml(ssml)
+        } catch {
+            // SDK threw — tear down the pending request.
+            requestLock.lock()
+            _activeRequest = nil
+            requestLock.unlock()
+            channel.finish(throwing: error)
+            throw error
+        }
+
+        // 3) Stamp the real resultId so completion/cancel callbacks can match.
+        requestLock.lock()
+        if let req = _activeRequest, req.channel === channel {
+            _activeRequest = ActiveSynthRequest(resultId: result.resultId, player: player, channel: channel)
+        }
+        requestLock.unlock()
+
+        // 4) If the SDK returned a synchronous cancellation, finish now.
         if result.reason == .canceled {
             finishActiveRequest(resultId: result.resultId, error: StreamSynthesizerError.synthesizeCancelled)
         }
@@ -160,10 +179,14 @@ public final class ReusableAzureSynthesizer: @unchecked Sendable {
 
     // MARK: - Private: request completion
 
-    /// Take the active request only if `resultId` matches exactly.
+    /// Take the active request if `resultId` matches. Also matches when
+    /// the stored resultId is still "" (placeholder installed before
+    /// startSpeakingSsml returned) — this covers the race where Azure's
+    /// completion callback fires before we stamp the real resultId.
     private func finishActiveRequest(resultId: String, error: Error?) {
         requestLock.lock()
-        guard let req = _activeRequest, req.resultId == resultId else {
+        guard let req = _activeRequest,
+              req.resultId == resultId || req.resultId.isEmpty else {
             requestLock.unlock()
             return
         }
